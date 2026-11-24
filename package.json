@@ -1,0 +1,24 @@
+{
+  "name": "linux-do-preview",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-browser extension (Chrome, Edge, Firefox) to preview Discourse / linux.do topics in a resizable floating modal.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "icons": "node scripts/generate-icons.mjs",
+    "build": "node scripts/build.ts all",
+    "build:chromium": "node scripts/build.ts chromium",
+    "build:firefox": "node scripts/build.ts firefox"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.320",
+    "@types/node": "^22.15.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.1.4"
+  }
+}

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Linux.do Topic Preview</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <div class="brand">
+          <span class="brand-badge" aria-hidden="true"></span>
+          <div>
+            <h1>Topic Preview</h1>
+            <p class="subtitle">悬浮预览 · 可调宽高弹窗</p>
+          </div>
+        </div>
+        <label class="switch" title="全局开关">
+          <input id="enabledToggle" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </header>
+
+      <section class="card">
+        <h2 class="section-title">弹窗偏好</h2>
+
+        <label class="row">
+          <div>
+            <div class="row-title">隐藏预览内顶部导航与侧栏</div>
+            <div class="row-desc">让弹窗聚焦在帖子正文与回复内容</div>
+          </div>
+          <span class="switch">
+            <input id="hideHeaderToggle" type="checkbox" />
+            <span class="slider"></span>
+          </span>
+        </label>
+
+        <label class="row">
+          <div>
+            <div class="row-title">点击窗口外遮罩关闭</div>
+            <div class="row-desc">也可随时按 Esc 键快速关闭预览</div>
+          </div>
+          <span class="switch">
+            <input id="backdropCloseToggle" type="checkbox" />
+            <span class="slider"></span>
+          </span>
+        </label>
+
+        <div class="row geometry-row">
+          <div>
+            <div class="row-title">记忆窗口尺寸</div>
+            <div id="geometryInfo" class="row-desc">默认居中自适应</div>
+          </div>
+          <button id="resetGeometryBtn" type="button" class="btn-secondary">
+            重置尺寸
+          </button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title">生效站点（Discourse）</h2>
+
+        <label class="row site-row">
+          <div class="site-meta">
+            <span class="site-host">linux.do</span>
+            <span class="tag">默认</span>
+          </div>
+          <span class="switch">
+            <input id="linuxDoToggle" type="checkbox" />
+            <span class="slider"></span>
+          </span>
+        </label>
+
+        <ul id="customDomainsList" class="domain-list"></ul>
+
+        <form id="addDomainForm" class="add-form" novalidate>
+          <input
+            id="domainInput"
+            type="text"
+            placeholder="例如 meta.discourse.org"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button type="submit" class="btn-primary">添加</button>
+        </form>
+        <p id="statusMsg" class="status-msg" role="status" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <script type="module" src="./popup.ts"></script>
+  </body>
+</html>
