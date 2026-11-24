@@ -11,7 +11,8 @@
     "icons": "node scripts/generate-icons.mjs",
     "build": "node scripts/build.ts all",
     "build:chromium": "node scripts/build.ts chromium",
-    "build:firefox": "node scripts/build.ts firefox"
+    "build:firefox": "node scripts/build.ts firefox",
+    "package": "node scripts/build.ts all && node scripts/package.ts"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.320",

@@ -12,18 +12,29 @@
 
 ## 开发与构建
 
-需要 Node.js 22+ 与 pnpm：
+需要 Node.js 24+ 与 pnpm：
 
 ```bash
 pnpm install
 pnpm run typecheck
 pnpm run test
 pnpm run build
+pnpm run package
 ```
 
 构建完成后会生成两个目标目录：
 - `dist/chromium/` — 适用于 **Chrome** 与 **Edge**
 - `dist/firefox/` — 适用于 **Firefox 128+**
+
+运行 `pnpm run package` 后，还会在 `release/` 目录生成可直接分发的压缩包：
+- `release/linux-do-preview-chromium-v*.zip`
+- `release/linux-do-preview-firefox-v*.zip`
+
+推送 `v*` 标签（例如 `git tag v1.0.0 && git push origin v1.0.0`）时，GitHub Actions 会自动执行类型检查、单元测试、打包并发布到 GitHub Releases。
+
+## 开源协议
+
+[MIT](./LICENSE)
 
 ## 安装与本地测试
 
