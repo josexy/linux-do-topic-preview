@@ -12,9 +12,14 @@ import {
 
 const CLEAN_CLASS = 'ldp-clean-mode';
 const STYLE_ID = 'ldp-iframe-enhancer-style';
+const ENHANCER_GUARD_KEY = '__ldpIframeEnhancerMounted__';
 const INITIAL_READY_FALLBACK_MS = 4000;
 const SPA_READY_FALLBACK_MS = 4000;
 const SPA_URL_SETTLE_MS = 120;
+
+type GuardedWindow = Window & {
+  [ENHANCER_GUARD_KEY]?: boolean;
+};
 
 const IFRAME_CSS = `
 html.${CLEAN_CLASS} {
@@ -174,6 +179,26 @@ function pauseMediaAndBlur(): void {
   }
 }
 
+function hasEmbeddedExternalIframe(): boolean {
+  const frames = document.querySelectorAll<HTMLIFrameElement>('iframe[src]');
+  for (const frame of frames) {
+    const rawSrc = frame.getAttribute('src')?.trim();
+    if (!rawSrc || rawSrc === 'about:blank') continue;
+    try {
+      const parsed = new URL(rawSrc, window.location.href);
+      if (
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        parsed.origin !== window.location.origin
+      ) {
+        return true;
+      }
+    } catch {
+      // Ignore malformed iframe URLs
+    }
+  }
+  return false;
+}
+
 /**
  * Triggers Discourse's built-in SPA click interceptor cleanly by dispatching
  * a synthetic click on a temporary internal anchor inside `#main-outlet` / `#main`.
@@ -239,24 +264,44 @@ function initIframeEnhancer(): void {
     return;
   }
 
+  // Prevent duplicate listener / observer attachment on re-injection
+  const guardedWindow = window as GuardedWindow;
+  if (guardedWindow[ENHANCER_GUARD_KEY]) {
+    return;
+  }
+  guardedWindow[ENHANCER_GUARD_KEY] = true;
+
   injectStyle();
   // Enable clean mode optimistically to prevent header flash before async storage resolves
   setCleanMode(true);
 
-  void getSettings().then((settings) => {
-    setCleanMode(settings.hideIframeHeader);
-  });
+  const listenerController = new AbortController();
+  const { signal } = listenerController;
+  let isTornDown = false;
+
+  void getSettings()
+    .then((settings) => {
+      if (!isTornDown) {
+        setCleanMode(settings.hideIframeHeader);
+      }
+    })
+    .catch(() => {
+      // Ignore storage read errors when extension context is invalidated
+    });
 
   let hasInitialBootCompleted = false;
   let lastTitle = '';
   let lastUrl = '';
   let cancelPendingSpaWatch: (() => void) | null = null;
+  let cancelInitialBootWatch: (() => void) | null = null;
+  let titleObserver: MutationObserver | null = null;
 
   const emitMeta = (
     isReady = false,
     requestId?: number,
     spaCapable?: boolean,
   ) => {
+    if (isTornDown) return;
     const title = document.title.trim();
     const url = window.location.href;
     if (!isReady && title === lastTitle && url === lastUrl) {
@@ -295,12 +340,22 @@ function initIframeEnhancer(): void {
 
     let finished = false;
     let urlMatchedAt: number | null = null;
+    let rafId: number | null = null;
     const startedAt = Date.now();
 
-    const cleanup = () => {
+    const stopWatching = () => {
       observer.disconnect();
       window.clearInterval(pollTimer);
       window.clearTimeout(fallbackTimer);
+    };
+
+    const cleanup = () => {
+      finished = true;
+      stopWatching();
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
       if (cancelPendingSpaWatch === cleanup) {
         cancelPendingSpaWatch = null;
       }
@@ -309,8 +364,12 @@ function initIframeEnhancer(): void {
     const complete = () => {
       if (finished) return;
       finished = true;
-      cleanup();
-      requestAnimationFrame(() => {
+      stopWatching();
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        if (cancelPendingSpaWatch === cleanup) {
+          cancelPendingSpaWatch = null;
+        }
         emitMeta(true, requestId, true);
       });
     };
@@ -435,29 +494,39 @@ function initIframeEnhancer(): void {
     );
   };
 
-  window.addEventListener('message', (event: MessageEvent) => {
-    if (event.origin !== window.location.origin) return;
-    const msg = event.data as Partial<ParentToIframeMessage> | null;
-    if (!msg || typeof msg.type !== 'string') return;
+  window.addEventListener(
+    'message',
+    (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.source !== window.parent) return;
+      const msg = event.data as Partial<ParentToIframeMessage> | null;
+      if (!msg || typeof msg.type !== 'string') return;
 
-    if (msg.type === 'LDP_SET_CLEAN_MODE' && typeof msg.enabled === 'boolean') {
-      setCleanMode(msg.enabled);
-      return;
-    }
+      if (msg.type === 'LDP_SET_CLEAN_MODE' && typeof msg.enabled === 'boolean') {
+        setCleanMode(msg.enabled);
+        return;
+      }
 
-    if (msg.type === 'LDP_DEACTIVATE') {
-      pauseMediaAndBlur();
-      return;
-    }
+      if (msg.type === 'LDP_DEACTIVATE') {
+        pauseMediaAndBlur();
+        // Cross-origin embedded players (e.g. YouTube/Bilibili) cannot be paused from JS;
+        // ask parent to unload the warm iframe so audio/video stops immediately.
+        if (hasEmbeddedExternalIframe()) {
+          postToParent({ type: 'LDP_REQUEST_UNLOAD' });
+        }
+        return;
+      }
 
-    if (
-      msg.type === 'LDP_NAVIGATE' &&
-      typeof msg.url === 'string' &&
-      typeof msg.requestId === 'number'
-    ) {
-      handleNavigateMessage(msg.url, msg.requestId);
-    }
-  });
+      if (
+        msg.type === 'LDP_NAVIGATE' &&
+        typeof msg.url === 'string' &&
+        typeof msg.requestId === 'number'
+      ) {
+        handleNavigateMessage(msg.url, msg.requestId);
+      }
+    },
+    { signal },
+  );
 
   // Forward Esc key to close modal unless user is typing or dismissing a Discourse dialog
   window.addEventListener(
@@ -470,7 +539,7 @@ function initIframeEnhancer(): void {
       event.preventDefault();
       postToParent({ type: 'LDP_CLOSE' });
     },
-    true,
+    { capture: true, signal },
   );
 
   // Open external-origin links in a new tab so they are not blocked inside the preview iframe
@@ -502,15 +571,24 @@ function initIframeEnhancer(): void {
         anchor.rel = 'noopener noreferrer';
       }
     },
-    true,
+    { capture: true, signal },
   );
 
   const attachObservers = () => {
+    if (isTornDown) return;
     postToParent({ type: 'LDP_BOOTING', url: window.location.href });
+
+    // Fast-path for non-Discourse pages or Cloudflare challenges so they aren't masked
+    // and no unnecessary observers/listeners are attached
+    if (isChallengeOrNonDiscoursePage()) {
+      hasInitialBootCompleted = true;
+      emitMeta(true, undefined, false);
+      return;
+    }
 
     const titleNode = document.querySelector('title');
     if (titleNode) {
-      const titleObserver = new MutationObserver(() => emitMeta(false));
+      titleObserver = new MutationObserver(() => emitMeta(false));
       titleObserver.observe(titleNode, {
         childList: true,
         characterData: true,
@@ -518,17 +596,25 @@ function initIframeEnhancer(): void {
       });
     }
 
-    window.addEventListener('popstate', () => emitMeta(false));
-    window.addEventListener('hashchange', () => emitMeta(false));
-
-    // Fast-path for non-Discourse pages or Cloudflare challenges so they aren't masked
-    if (isChallengeOrNonDiscoursePage()) {
-      hasInitialBootCompleted = true;
-      emitMeta(true, undefined, false);
-      return;
-    }
+    window.addEventListener('popstate', () => emitMeta(false), { signal });
+    window.addEventListener('hashchange', () => emitMeta(false), { signal });
 
     let initialReadyEmitted = false;
+    let bootRafId: number | null = null;
+
+    const cancelBootWatch = () => {
+      initialReadyEmitted = true;
+      bootObserver.disconnect();
+      window.clearTimeout(fallbackTimer);
+      if (bootRafId !== null) {
+        window.cancelAnimationFrame(bootRafId);
+        bootRafId = null;
+      }
+      if (cancelInitialBootWatch === cancelBootWatch) {
+        cancelInitialBootWatch = null;
+      }
+    };
+
     const finishInitialBoot = () => {
       if (initialReadyEmitted) return;
       initialReadyEmitted = true;
@@ -536,7 +622,11 @@ function initIframeEnhancer(): void {
       bootObserver.disconnect();
       window.clearTimeout(fallbackTimer);
       const spaCapable = Boolean(document.querySelector('#main-outlet, #main'));
-      requestAnimationFrame(() => {
+      bootRafId = window.requestAnimationFrame(() => {
+        bootRafId = null;
+        if (cancelInitialBootWatch === cancelBootWatch) {
+          cancelInitialBootWatch = null;
+        }
         emitMeta(true, undefined, spaCapable);
       });
     };
@@ -551,6 +641,7 @@ function initIframeEnhancer(): void {
       finishInitialBoot,
       INITIAL_READY_FALLBACK_MS,
     );
+    cancelInitialBootWatch = cancelBootWatch;
 
     if (hasRenderedContent()) {
       finishInitialBoot();
@@ -566,8 +657,27 @@ function initIframeEnhancer(): void {
     });
   };
 
+  window.addEventListener(
+    'pagehide',
+    (event: PageTransitionEvent) => {
+      cancelPendingSpaWatch?.();
+      cancelInitialBootWatch?.();
+      if (!event.persisted) {
+        isTornDown = true;
+        titleObserver?.disconnect();
+        titleObserver = null;
+        listenerController.abort();
+        guardedWindow[ENHANCER_GUARD_KEY] = false;
+      }
+    },
+    { signal },
+  );
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', attachObservers, { once: true });
+    document.addEventListener('DOMContentLoaded', attachObservers, {
+      once: true,
+      signal,
+    });
   } else {
     attachObservers();
   }

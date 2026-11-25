@@ -46,7 +46,8 @@ export type IframeToParentMessage =
       requestId: number;
       mode: 'spa' | 'same' | 'fallback';
     }
-  | { type: 'LDP_CLOSE' };
+  | { type: 'LDP_CLOSE' }
+  | { type: 'LDP_REQUEST_UNLOAD' };
 
 export type ParentToIframeMessage =
   | {
