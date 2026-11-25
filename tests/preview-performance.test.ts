@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HoverTrigger } from '../src/content/hover-trigger';
 import { PreviewModal } from '../src/content/preview-modal';
 import { DEFAULT_SETTINGS, type IframeToParentMessage } from '../src/shared/types';
+import { getPreviewNavigationId, PREVIEW_ACTIVE_ATTRIBUTE } from '../src/shared/iframe-navigation';
 
 function installMockWebExtApi(): void {
   const listeners = new Set<(...args: unknown[]) => void>();
@@ -24,11 +25,12 @@ function installMockWebExtApi(): void {
 function dispatchIframeMessage(
   iframe: HTMLIFrameElement,
   data: IframeToParentMessage,
+  navigationId = getPreviewNavigationId(iframe.name),
 ): void {
   const event = new MessageEvent('message', {
     origin: window.location.origin,
     source: iframe.contentWindow,
-    data,
+    data: { ...data, navigationId },
   });
   window.dispatchEvent(event);
 }
@@ -116,6 +118,7 @@ describe('HoverTrigger preloading', () => {
 });
 
 describe('PreviewModal warm iframe reuse & SPA routing', () => {
+  const instances: PreviewModal[] = [];
   beforeEach(() => {
     vi.useFakeTimers();
     installMockWebExtApi();
@@ -127,6 +130,7 @@ describe('PreviewModal warm iframe reuse & SPA routing', () => {
   });
 
   afterEach(() => {
+    instances.splice(0).forEach((modal) => modal.destroy());
     vi.useRealTimers();
     vi.unstubAllGlobals();
     document.body.innerHTML = '';
@@ -138,6 +142,7 @@ describe('PreviewModal warm iframe reuse & SPA routing', () => {
     document.body.appendChild(host);
 
     const modal = new PreviewModal(shadow, { ...DEFAULT_SETTINGS });
+    instances.push(modal);
     const iframe = shadow.querySelector('iframe.ldp-iframe') as HTMLIFrameElement;
     const loadingMask = shadow.querySelector('.ldp-loading-mask') as HTMLDivElement;
     const overlay = shadow.querySelector('.ldp-overlay') as HTMLDivElement;
@@ -177,7 +182,7 @@ describe('PreviewModal warm iframe reuse & SPA routing', () => {
     vi.advanceTimersByTime(200);
     expect(iframe.src).toBe(urlA);
     expect(postMessageSpy).toHaveBeenCalledWith(
-      { type: 'LDP_DEACTIVATE' },
+      { type: 'LDP_DEACTIVATE', navigationId: getPreviewNavigationId(iframe.name) },
       window.location.origin,
     );
 
@@ -293,6 +298,7 @@ describe('PreviewModal warm iframe reuse & SPA routing', () => {
     // Preload A starts, then user opens B before A finishes
     modal.preload(urlA);
     dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url: urlA });
+    const navigationIdA = getPreviewNavigationId(iframe.name);
 
     modal.open(urlB, 'Topic 702');
     expect(iframe.src).toBe(urlB);
@@ -304,7 +310,7 @@ describe('PreviewModal warm iframe reuse & SPA routing', () => {
       title: 'Topic 701',
       url: urlA,
       spaCapable: true,
-    });
+    }, navigationIdA);
     expect(loadingMask.classList.contains('is-active')).toBe(true);
 
     // Now B boots and finishes
@@ -318,5 +324,102 @@ describe('PreviewModal warm iframe reuse & SPA routing', () => {
     expect(loadingMask.classList.contains('is-active')).toBe(false);
 
     modal.destroy();
+  });
+
+  it('opens a completed inactive preload immediately without reloading or SPA navigation', () => {
+    const { modal, iframe, loadingMask, postMessageSpy } = setupModal();
+    const url = `${window.location.origin}/t/topic/801`;
+    modal.preload(url);
+    expect(iframe.getAttribute(PREVIEW_ACTIVE_ATTRIBUTE)).toBe('false');
+    const navigationId = getPreviewNavigationId(iframe.name);
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url });
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'Topic', spaCapable: true });
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { type: 'LDP_DEACTIVATE', preserveIframe: true, navigationId }, window.location.origin,
+    );
+
+    const srcSpy = vi.spyOn(iframe, 'src', 'set');
+    postMessageSpy.mockClear();
+    modal.open(url, 'Topic');
+    expect(loadingMask.classList.contains('is-active')).toBe(false);
+    expect(iframe.getAttribute(PREVIEW_ACTIVE_ATTRIBUTE)).toBe('true');
+    expect(srcSpy).not.toHaveBeenCalled();
+    expect(postMessageSpy).toHaveBeenCalledWith({ type: 'LDP_ACTIVATE', navigationId }, window.location.origin);
+    expect(postMessageSpy).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'LDP_NAVIGATE' }), expect.anything());
+  });
+
+  it('activates an in-flight preload without restarting it or waiting for another handshake', () => {
+    const { modal, iframe, loadingMask, postMessageSpy } = setupModal();
+    const url = `${window.location.origin}/t/topic/802`;
+    modal.preload(url);
+    const srcSpy = vi.spyOn(iframe, 'src', 'set');
+    modal.open(url, 'Topic');
+    expect(iframe.getAttribute(PREVIEW_ACTIVE_ATTRIBUTE)).toBe('true');
+    postMessageSpy.mockClear();
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url });
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'Topic', spaCapable: true });
+    expect(srcSpy).not.toHaveBeenCalled();
+    expect(loadingMask.classList.contains('is-active')).toBe(false);
+    expect(postMessageSpy).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'LDP_DEACTIVATE' }), expect.anything());
+  });
+
+  it('preserves warm reuse when reopened during the closing animation', () => {
+    const { modal, iframe, overlay, loadingMask } = setupModal();
+    const url = `${window.location.origin}/t/topic/803`;
+    modal.open(url, 'Topic');
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url });
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'Topic', spaCapable: true });
+    modal.close();
+    vi.advanceTimersByTime(80);
+    modal.close();
+    const srcSpy = vi.spyOn(iframe, 'src', 'set');
+    modal.open(url, 'Topic');
+    vi.advanceTimersByTime(181_000);
+    expect(srcSpy).not.toHaveBeenCalled();
+    expect(overlay.classList.contains('is-open')).toBe(true);
+    expect(loadingMask.classList.contains('is-active')).toBe(false);
+  });
+
+  it('rejects messages from an earlier cold load of the same URL, even after the new boot', () => {
+    const { modal, iframe, loadingMask } = setupModal();
+    const url = `${window.location.origin}/t/topic/804`;
+    modal.preload(url);
+    const oldNavigationId = getPreviewNavigationId(iframe.name);
+    modal.close({ unload: true });
+    modal.open(url, 'Topic');
+
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url }, oldNavigationId);
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'Old', spaCapable: true }, oldNavigationId);
+    expect(loadingMask.classList.contains('is-active')).toBe(true);
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url });
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'Old', spaCapable: true }, oldNavigationId);
+    expect(loadingMask.classList.contains('is-active')).toBe(true);
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'New', spaCapable: true });
+    expect(loadingMask.classList.contains('is-active')).toBe(false);
+  });
+
+  it('keeps the same document for SPA preload and still falls back after the existing ACK timeout', () => {
+    const { modal, iframe, loadingMask, postMessageSpy } = setupModal();
+    const urlA = `${window.location.origin}/t/topic/805`;
+    const urlB = `${window.location.origin}/t/topic/806`;
+    modal.preload(urlA);
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url: urlA });
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url: urlA, title: 'A', spaCapable: true });
+    const initialNavigationId = getPreviewNavigationId(iframe.name);
+    const srcSpy = vi.spyOn(iframe, 'src', 'set');
+    modal.preload(urlB);
+    modal.open(urlB, 'B');
+    expect(srcSpy).not.toHaveBeenCalled();
+    expect(getPreviewNavigationId(iframe.name)).toBe(initialNavigationId);
+    const nav = postMessageSpy.mock.calls.find(([msg]) => msg.type === 'LDP_NAVIGATE')![0];
+    expect(nav).toMatchObject({ url: urlB, navigationId: initialNavigationId });
+    // A duplicate initial READY from this document must not finish the SPA request.
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url: urlA, title: 'A', spaCapable: true });
+    expect(loadingMask.classList.contains('is-active')).toBe(true);
+    vi.advanceTimersByTime(279);
+    expect(srcSpy).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(srcSpy).toHaveBeenCalledExactlyOnceWith(urlB);
+    expect(getPreviewNavigationId(iframe.name)).not.toBe(initialNavigationId);
   });
 });

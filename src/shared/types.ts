@@ -60,7 +60,12 @@ export type ParentToIframeMessage =
       requestId: number;
     }
   | {
+      type: 'LDP_ACTIVATE';
+    }
+  | {
       type: 'LDP_DEACTIVATE';
+      /** Keep speculative preloads warm, suspending embedded players individually. */
+      preserveIframe?: boolean;
     };
 
 export type RuntimeMessage = {

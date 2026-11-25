@@ -1,6 +1,10 @@
 import { getSettings } from '../shared/storage';
 import {
-  PREVIEW_IFRAME_NAME,
+  getPreviewNavigationId,
+  PREVIEW_ACTIVE_ATTRIBUTE,
+  type PreviewFrameMessage,
+} from '../shared/iframe-navigation';
+import {
   type IframeToParentMessage,
   type ParentToIframeMessage,
 } from '../shared/types';
@@ -9,6 +13,7 @@ import {
   parseTopicIdentity,
   type TopicIdentity,
 } from './topic-matcher';
+import { createPreviewMediaController, hasEmbeddedExternalIframe } from './iframe-media';
 
 const CLEAN_CLASS = 'ldp-clean-mode';
 const STYLE_ID = 'ldp-iframe-enhancer-style';
@@ -80,14 +85,6 @@ function injectStyle(): void {
 
 function setCleanMode(enabled: boolean): void {
   document.documentElement.classList.toggle(CLEAN_CLASS, enabled);
-}
-
-function postToParent(message: IframeToParentMessage): void {
-  try {
-    window.parent.postMessage(message, window.location.origin);
-  } catch {
-    // Ignore when parent origin mismatches
-  }
 }
 
 function isEditableElement(target: EventTarget | null): boolean {
@@ -163,42 +160,6 @@ function getFirstPostSignature(): string {
   return titleText;
 }
 
-function pauseMediaAndBlur(): void {
-  const mediaEls = document.querySelectorAll<HTMLMediaElement>('video, audio');
-  for (const media of mediaEls) {
-    try {
-      if (!media.paused) {
-        media.pause();
-      }
-    } catch {
-      // Ignore media pause errors
-    }
-  }
-  if (document.activeElement instanceof HTMLElement) {
-    document.activeElement.blur();
-  }
-}
-
-function hasEmbeddedExternalIframe(): boolean {
-  const frames = document.querySelectorAll<HTMLIFrameElement>('iframe[src]');
-  for (const frame of frames) {
-    const rawSrc = frame.getAttribute('src')?.trim();
-    if (!rawSrc || rawSrc === 'about:blank') continue;
-    try {
-      const parsed = new URL(rawSrc, window.location.href);
-      if (
-        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-        parsed.origin !== window.location.origin
-      ) {
-        return true;
-      }
-    } catch {
-      // Ignore malformed iframe URLs
-    }
-  }
-  return false;
-}
-
 /**
  * Triggers Discourse's built-in SPA click interceptor cleanly by dispatching
  * a synthetic click on a temporary internal anchor inside `#main-outlet` / `#main`.
@@ -260,7 +221,12 @@ function triggerDiscourseSpaClick(relativeHref: string): boolean {
 
 function initIframeEnhancer(): void {
   // Fast exit on regular top-level pages or unrelated iframes
-  if (window.self === window.top || window.name !== PREVIEW_IFRAME_NAME) {
+  // Updating iframe.name does not always update an existing WindowProxy's name.
+  // Read the element's current generation synchronously at document_start.
+  const navigationId = getPreviewNavigationId(
+    window.frameElement?.getAttribute('name') ?? window.name,
+  );
+  if (window.self === window.top || navigationId === null) {
     return;
   }
 
@@ -278,6 +244,20 @@ function initIframeEnhancer(): void {
   const listenerController = new AbortController();
   const { signal } = listenerController;
   let isTornDown = false;
+  const mediaController = createPreviewMediaController(
+    window.frameElement?.getAttribute(PREVIEW_ACTIVE_ATTRIBUTE) === 'true',
+    signal,
+  );
+
+  const postToParent = (message: IframeToParentMessage): void => {
+    if (isTornDown) return;
+    try {
+      // Capture the document's generation once, never read the mutable frame name here.
+      window.parent.postMessage({ ...message, navigationId }, window.location.origin);
+    } catch {
+      // Ignore when parent origin mismatches.
+    }
+  };
 
   void getSettings()
     .then((settings) => {
@@ -499,19 +479,26 @@ function initIframeEnhancer(): void {
     (event: MessageEvent) => {
       if (event.origin !== window.location.origin) return;
       if (event.source !== window.parent) return;
-      const msg = event.data as Partial<ParentToIframeMessage> | null;
+      const msg = event.data as Partial<PreviewFrameMessage<ParentToIframeMessage>> | null;
       if (!msg || typeof msg.type !== 'string') return;
+      if (msg.navigationId !== navigationId) return;
 
       if (msg.type === 'LDP_SET_CLEAN_MODE' && typeof msg.enabled === 'boolean') {
         setCleanMode(msg.enabled);
         return;
       }
 
+      if (msg.type === 'LDP_ACTIVATE') {
+        mediaController.setActive(true);
+        return;
+      }
+
       if (msg.type === 'LDP_DEACTIVATE') {
-        pauseMediaAndBlur();
-        // Cross-origin embedded players (e.g. YouTube/Bilibili) cannot be paused from JS;
-        // ask parent to unload the warm iframe so audio/video stops immediately.
-        if (hasEmbeddedExternalIframe()) {
+        const unloadEmbedded = !msg.preserveIframe && hasEmbeddedExternalIframe();
+        mediaController.setActive(false);
+        // Keep the existing unload-on-close policy; speculative preloads retain the
+        // Discourse document and suspend only the external players until activation.
+        if (unloadEmbedded) {
           postToParent({ type: 'LDP_REQUEST_UNLOAD' });
         }
         return;

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HoverTrigger } from '../src/content/hover-trigger';
 import { PreviewModal } from '../src/content/preview-modal';
 import { DEFAULT_SETTINGS, type IframeToParentMessage } from '../src/shared/types';
+import { getPreviewNavigationId } from '../src/shared/iframe-navigation';
 
 function installMockWebExtApi(): void {
   const listeners = new Set<(...args: unknown[]) => void>();
@@ -24,11 +25,12 @@ function installMockWebExtApi(): void {
 function dispatchIframeMessage(
   iframe: HTMLIFrameElement,
   data: IframeToParentMessage,
+  navigationId = getPreviewNavigationId(iframe.name),
 ): void {
   const event = new MessageEvent('message', {
     origin: window.location.origin,
     source: iframe.contentWindow,
-    data,
+    data: { ...data, navigationId },
   });
   window.dispatchEvent(event);
 }
@@ -46,6 +48,7 @@ function createPointerEvent(
 }
 
 describe('PreviewModal resource cleanup & leak prevention', () => {
+  const instances: PreviewModal[] = [];
   beforeEach(() => {
     vi.useFakeTimers();
     installMockWebExtApi();
@@ -62,6 +65,7 @@ describe('PreviewModal resource cleanup & leak prevention', () => {
   });
 
   afterEach(() => {
+    instances.splice(0).forEach((modal) => modal.destroy());
     vi.useRealTimers();
     vi.unstubAllGlobals();
     document.body.innerHTML = '';
@@ -73,6 +77,7 @@ describe('PreviewModal resource cleanup & leak prevention', () => {
     document.body.appendChild(host);
 
     const modal = new PreviewModal(shadow, { ...DEFAULT_SETTINGS });
+    instances.push(modal);
     const iframe = shadow.querySelector('iframe.ldp-iframe') as HTMLIFrameElement;
     const modalEl = shadow.querySelector('.ldp-modal') as HTMLDivElement;
     const header = shadow.querySelector('.ldp-header') as HTMLDivElement;
@@ -98,6 +103,9 @@ describe('PreviewModal resource cleanup & leak prevention', () => {
       copyBtn,
       postMessageSpy,
       replaceSpy,
+      overlay: shadow.querySelector('.ldp-overlay') as HTMLDivElement,
+      backdrop: shadow.querySelector('.ldp-backdrop') as HTMLDivElement,
+      loadingMask: shadow.querySelector('.ldp-loading-mask') as HTMLDivElement,
     };
   }
 
@@ -270,6 +278,139 @@ describe('PreviewModal resource cleanup & leak prevention', () => {
     expect(modalEl.classList.contains('is-interacting')).toBe(false);
 
     modal.destroy();
+  });
+
+  function markReady(iframe: HTMLIFrameElement, url: string): void {
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url });
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'Topic', spaCapable: true });
+  }
+
+  function setHidden(hidden: boolean): void {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  it('finishes the original close animation after repeated backdrop clicks', () => {
+    const { modal, iframe, overlay, backdrop } = setupModal();
+    const url = `${window.location.origin}/t/topic/301`;
+    modal.open(url, 'Topic');
+    markReady(iframe, url);
+
+    backdrop.click();
+    vi.advanceTimersByTime(80);
+    backdrop.click();
+    vi.advanceTimersByTime(81);
+
+    expect(overlay.classList.contains('is-open')).toBe(false);
+    expect(overlay.getAttribute('aria-hidden')).toBe('true');
+    expect(iframe.src).toBe(url);
+    vi.advanceTimersByTime(180_000);
+    expect(iframe.src).toBe('about:blank');
+  });
+
+  it.each(['embedded media', 'loading', 'disable'])('preserves pending unload on repeated close: %s', (reason) => {
+    const { modal, iframe, overlay } = setupModal();
+    const url = `${window.location.origin}/t/topic/302`;
+    modal.open(url, 'Topic');
+    if (reason !== 'loading') markReady(iframe, url);
+    modal.close();
+    if (reason === 'embedded media') {
+      dispatchIframeMessage(iframe, { type: 'LDP_REQUEST_UNLOAD' });
+    }
+    vi.advanceTimersByTime(80);
+    // Completing the load must not weaken the unload decision made at close time.
+    if (reason === 'loading') markReady(iframe, url);
+    if (reason === 'disable') modal.setEnabled(false);
+    modal.close();
+    vi.advanceTimersByTime(81);
+
+    expect(iframe.src).toBe('about:blank');
+    expect(overlay.classList.contains('is-open')).toBe(false);
+    expect(overlay.getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('does not renew the idle lifetime on repeated tab switches', () => {
+    const { modal, iframe } = setupModal();
+    const url = `${window.location.origin}/t/topic/303`;
+    modal.open(url, 'Topic');
+    markReady(iframe, url);
+    modal.close();
+    vi.advanceTimersByTime(200);
+
+    for (let i = 0; i < 15; i++) {
+      setHidden(true);
+      vi.advanceTimersByTime(20_000);
+      setHidden(false);
+      vi.advanceTimersByTime(20_000);
+    }
+    expect(iframe.src).toBe('about:blank');
+  });
+
+  it('keeps the earlier deadline when entering the background near expiry', () => {
+    const { modal, iframe } = setupModal();
+    const url = `${window.location.origin}/t/topic/304`;
+    modal.preload(url);
+    markReady(iframe, url);
+    vi.advanceTimersByTime(170_000);
+    setHidden(true);
+    vi.advanceTimersByTime(10_001);
+    expect(iframe.src).toBe('about:blank');
+  });
+
+  it('checks the absolute deadline on return even if background timers were suspended', () => {
+    const { modal, iframe } = setupModal();
+    const url = `${window.location.origin}/t/topic/305`;
+    modal.preload(url);
+    markReady(iframe, url);
+    setHidden(true);
+    vi.setSystemTime(Date.now() + 60_000);
+    setHidden(false);
+    expect(iframe.src).toBe('about:blank');
+  });
+
+  it('does not renew the idle lifetime merely because a slow preload finished', () => {
+    const { modal, iframe } = setupModal();
+    const url = `${window.location.origin}/t/topic/306`;
+    modal.preload(url);
+    vi.advanceTimersByTime(120_000);
+    markReady(iframe, url);
+    vi.advanceTimersByTime(60_001);
+    expect(iframe.src).toBe('about:blank');
+  });
+
+  it('allows a new explicit preload interaction to renew the warm cache without reloading', () => {
+    const { modal, iframe } = setupModal();
+    const url = `${window.location.origin}/t/topic/307`;
+    modal.preload(url);
+    markReady(iframe, url);
+    vi.advanceTimersByTime(170_000);
+    const srcSpy = vi.spyOn(iframe, 'src', 'set');
+    modal.preload(url);
+    vi.advanceTimersByTime(20_000);
+    expect(srcSpy).not.toHaveBeenCalled();
+    expect(iframe.src).toBe(url);
+    vi.advanceTimersByTime(160_001);
+    expect(iframe.src).toBe('about:blank');
+  });
+
+  it('ignores late boot, ready and metadata messages after unloading', () => {
+    const { modal, iframe, loadingMask } = setupModal();
+    const url = `${window.location.origin}/t/topic/308`;
+    modal.preload(url);
+    markReady(iframe, url);
+    const oldNavigationId = getPreviewNavigationId(iframe.name);
+    modal.close({ unload: true });
+    dispatchIframeMessage(iframe, { type: 'LDP_BOOTING', url }, oldNavigationId);
+    dispatchIframeMessage(iframe, { type: 'LDP_READY', url, title: 'Late', spaCapable: true }, oldNavigationId);
+    dispatchIframeMessage(iframe, { type: 'LDP_META_UPDATE', url, title: 'Late' }, oldNavigationId);
+    expect(vi.getTimerCount()).toBe(0);
+
+    modal.open(url, 'Topic');
+    expect(iframe.src).toBe(url);
+    expect(getPreviewNavigationId(iframe.name)).not.toBe(oldNavigationId);
+    expect(loadingMask.classList.contains('is-active')).toBe(true);
+    markReady(iframe, url);
+    expect(loadingMask.classList.contains('is-active')).toBe(false);
   });
 
   it('guards async clipboard copy against scheduling timers after destroy()', async () => {

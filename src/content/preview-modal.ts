@@ -1,4 +1,9 @@
 import {
+  createPreviewFrameName,
+  PREVIEW_ACTIVE_ATTRIBUTE,
+  type PreviewFrameMessage,
+} from '../shared/iframe-navigation';
+import {
   getWindowGeometry,
   saveWindowGeometry,
   subscribeWindowGeometry,
@@ -85,6 +90,8 @@ export class PreviewModal {
   private isIframeBooted = false;
   private hasBootingAck = false;
   private activeRequestId = 0;
+  private iframeNavigationId: number | null = null;
+  private nextIframeNavigationId = 0;
 
   private currentRect: WindowRect | null = null;
   private restoreRect: WindowRect | null = null;
@@ -306,16 +313,18 @@ export class PreviewModal {
    */
   public preload(url: string): void {
     if (this.isDestroyed || !this.isEnabled || this.isOpen || !url) return;
-    if (this.loadState === 'ready' && isSameTopicTarget(url, this.loadedUrl)) {
-      this.scheduleIdleUnload(IDLE_UNLOAD_TIMEOUT_MS);
-      return;
+    // Only an explicit preview interaction renews the idle lifetime.
+    this.clearIdleUnloadTimer();
+    this.syncIframeActivity();
+    if (
+      !(this.loadState === 'ready' && isSameTopicTarget(url, this.loadedUrl)) &&
+      !(this.loadState === 'loading' && isSameTopicTarget(url, this.pendingUrl))
+    ) {
+      this.navigateTo(url, { silent: true, forceHardReload: false });
     }
-    if (this.loadState === 'loading' && isSameTopicTarget(url, this.pendingUrl)) {
-      this.scheduleIdleUnload(IDLE_UNLOAD_TIMEOUT_MS);
-      return;
-    }
-    this.navigateTo(url, { silent: true, forceHardReload: false });
-    this.scheduleIdleUnload(IDLE_UNLOAD_TIMEOUT_MS);
+    this.scheduleIdleUnload(
+      document.hidden ? HIDDEN_TAB_UNLOAD_TIMEOUT_MS : IDLE_UNLOAD_TIMEOUT_MS,
+    );
   }
 
   public open(url: string, title: string): void {
@@ -347,6 +356,8 @@ export class PreviewModal {
       });
     }
 
+    this.syncIframeActivity();
+
     // 1. Instant open: requested topic is already loaded in the warm iframe
     if (this.loadState === 'ready' && isSameTopicTarget(url, this.loadedUrl)) {
       if (this.loadedUrl) {
@@ -368,14 +379,19 @@ export class PreviewModal {
   }
 
   public close(options?: { unload?: boolean }): void {
+    if (this.isDestroyed) return;
     // Also abort in-flight loads on close so abandoned loads do not finish and linger in memory
     const shouldUnload =
-      Boolean(options?.unload) || this.loadState === 'loading';
-    this.clearCloseTimer();
+      this.pendingUnloadOnClose || Boolean(options?.unload) || this.loadState === 'loading';
     this.clearOpenRaf();
     this.abortActiveInteraction?.();
 
     if (!this.isOpen) {
+      // Keep the original animation completion and any stronger unload request.
+      if (this.closeTimer !== null) {
+        this.pendingUnloadOnClose = shouldUnload;
+        return;
+      }
       if (shouldUnload) {
         this.resetIframe();
       } else if (this.hasWarmIframe()) {
@@ -390,6 +406,7 @@ export class PreviewModal {
     this.pendingUnloadOnClose = shouldUnload;
     this.clearFallbackTimer();
     this.overlay.classList.remove('is-visible');
+    this.iframe.setAttribute(PREVIEW_ACTIVE_ATTRIBUTE, 'false');
     this.postToIframe({ type: 'LDP_DEACTIVATE' });
     this.iframe.blur();
 
@@ -602,6 +619,9 @@ export class PreviewModal {
     this.clearColdLoadGraceTimer();
     this.isIframeBooted = false;
     this.hasBootingAck = false;
+    // The enhancer snapshots this before any async work; SPA navigation keeps it.
+    this.iframeNavigationId = ++this.nextIframeNavigationId;
+    this.iframe.name = createPreviewFrameName(this.iframeNavigationId);
 
     if (forceReload && this.iframe.src === url && this.iframe.contentWindow) {
       try {
@@ -625,12 +645,17 @@ export class PreviewModal {
 
   private scheduleIdleUnload(delayMs: number): void {
     if (this.isDestroyed || this.isOpen || !this.hasWarmIframe()) return;
-    const targetDeadline = Date.now() + delayMs;
+    const now = Date.now();
+    const targetDeadline = Math.min(
+      this.idleUnloadDeadline || Infinity,
+      now + delayMs,
+    );
+    if (targetDeadline <= now) {
+      this.resetIframe();
+      return;
+    }
     if (this.idleUnloadTimer !== null) {
-      // Keep an earlier deadline if we're only trying to extend while hidden
-      if (document.hidden && this.idleUnloadDeadline <= targetDeadline) {
-        return;
-      }
+      if (this.idleUnloadDeadline === targetDeadline) return;
       window.clearTimeout(this.idleUnloadTimer);
       this.idleUnloadTimer = null;
     }
@@ -641,7 +666,7 @@ export class PreviewModal {
       if (!this.isDestroyed && !this.isOpen && this.hasWarmIframe()) {
         this.resetIframe();
       }
-    }, delayMs);
+    }, targetDeadline - now);
   }
 
   private clearIdleUnloadTimer(): void {
@@ -661,6 +686,8 @@ export class PreviewModal {
 
   private resetIframe(): void {
     this.activeRequestId += 1;
+    this.iframeNavigationId = null;
+    this.iframe.name = PREVIEW_IFRAME_NAME;
     this.clearNavAckTimer();
     this.clearColdLoadGraceTimer();
     this.clearFallbackTimer();
@@ -736,13 +763,26 @@ export class PreviewModal {
   }
 
   private postToIframe(message: ParentToIframeMessage): boolean {
-    if (!this.iframe.contentWindow) return false;
+    if (!this.iframe.contentWindow || this.iframeNavigationId === null) return false;
     try {
-      this.iframe.contentWindow.postMessage(message, window.location.origin);
+      this.iframe.contentWindow.postMessage(
+        { ...message, navigationId: this.iframeNavigationId },
+        window.location.origin,
+      );
       return true;
     } catch {
       return false;
     }
+  }
+
+  private syncIframeActivity(): void {
+    // Also available synchronously at document_start, before postMessage listeners exist.
+    this.iframe.setAttribute(PREVIEW_ACTIVE_ATTRIBUTE, String(this.isOpen));
+    this.postToIframe(
+      this.isOpen
+        ? { type: 'LDP_ACTIVATE' }
+        : { type: 'LDP_DEACTIVATE', preserveIframe: true },
+    );
   }
 
   private postCleanModeToIframe(): void {
@@ -1051,11 +1091,13 @@ export class PreviewModal {
   };
 
   private readonly handleWindowMessage = (event: MessageEvent): void => {
+    if (this.isDestroyed || this.loadState === 'idle' || this.iframeNavigationId === null) return;
     if (event.origin !== window.location.origin) return;
     if (event.source !== this.iframe.contentWindow) return;
 
-    const msg = event.data as Partial<IframeToParentMessage> | null;
+    const msg = event.data as Partial<PreviewFrameMessage<IframeToParentMessage>> | null;
     if (!msg || typeof msg.type !== 'string') return;
+    if (msg.navigationId !== this.iframeNavigationId) return;
 
     if (msg.type === 'LDP_CLOSE') {
       if (this.isOpen) {
@@ -1079,6 +1121,7 @@ export class PreviewModal {
       this.hasBootingAck = true;
       this.clearColdLoadGraceTimer();
       this.postCleanModeToIframe();
+      this.syncIframeActivity();
       return;
     }
 
@@ -1102,7 +1145,7 @@ export class PreviewModal {
       if (
         msg.requestId === undefined &&
         this.loadState === 'loading' &&
-        !this.hasBootingAck
+        (!this.hasBootingAck || this.isIframeBooted)
       ) {
         return;
       }
@@ -1134,6 +1177,7 @@ export class PreviewModal {
         );
       }
       this.postCleanModeToIframe();
+      this.syncIframeActivity();
       return;
     }
 
