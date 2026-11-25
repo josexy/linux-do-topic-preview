@@ -2,6 +2,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   findTopicLinkFromTarget,
+  isSameTopicTarget,
+  parseTopicIdentity,
   parseTopicUrl,
 } from '../src/content/topic-matcher';
 
@@ -62,5 +64,54 @@ describe('topic-matcher', () => {
     // Arbitrary inline link inside post body should be excluded
     const bodyLink = document.querySelector('.post-body a');
     expect(findTopicLinkFromTarget(bodyLink, ORIGIN)).toBeNull();
+  });
+
+  it('extracts canonical topic identity and matches slug redirects', () => {
+    expect(parseTopicIdentity('https://linux.do/t/topic/123456')).toEqual({
+      origin: 'https://linux.do',
+      topicId: '123456',
+      postNumber: null,
+    });
+    expect(parseTopicIdentity('/t/real-slug/123456/18', ORIGIN)).toEqual({
+      origin: 'https://linux.do',
+      topicId: '123456',
+      postNumber: '18',
+    });
+    expect(parseTopicIdentity('https://linux.do/latest')).toBeNull();
+
+    // Slug redirect matches the same topic
+    expect(
+      isSameTopicTarget(
+        'https://linux.do/t/topic/123456',
+        'https://linux.do/t/actual-slug/123456',
+      ),
+    ).toBe(true);
+    // Requesting topic without post number matches any scrolled post in same topic
+    expect(
+      isSameTopicTarget(
+        'https://linux.do/t/topic/123456',
+        'https://linux.do/t/actual-slug/123456/7',
+      ),
+    ).toBe(true);
+    // Requesting a specific post number requires matching post number
+    expect(
+      isSameTopicTarget(
+        'https://linux.do/t/topic/123456/9',
+        'https://linux.do/t/actual-slug/123456/7',
+      ),
+    ).toBe(false);
+    expect(
+      isSameTopicTarget(
+        'https://linux.do/t/topic/123456/9',
+        'https://linux.do/t/actual-slug/123456/9',
+      ),
+    ).toBe(true);
+    // Different topic IDs do not match
+    expect(
+      isSameTopicTarget(
+        'https://linux.do/t/topic/123456',
+        'https://linux.do/t/topic/654321',
+      ),
+    ).toBe(false);
   });
 });

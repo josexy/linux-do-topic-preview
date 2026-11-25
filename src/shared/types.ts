@@ -32,14 +32,35 @@ export interface WindowGeometry {
 export type ResizeDirection = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 
 export type IframeToParentMessage =
-  | { type: 'LDP_READY'; title: string; url: string }
+  | { type: 'LDP_BOOTING'; url: string }
+  | {
+      type: 'LDP_READY';
+      title: string;
+      url: string;
+      requestId?: number;
+      spaCapable?: boolean;
+    }
   | { type: 'LDP_META_UPDATE'; title: string; url: string }
+  | {
+      type: 'LDP_NAV_ACK';
+      requestId: number;
+      mode: 'spa' | 'same' | 'fallback';
+    }
   | { type: 'LDP_CLOSE' };
 
-export type ParentToIframeMessage = {
-  type: 'LDP_SET_CLEAN_MODE';
-  enabled: boolean;
-};
+export type ParentToIframeMessage =
+  | {
+      type: 'LDP_SET_CLEAN_MODE';
+      enabled: boolean;
+    }
+  | {
+      type: 'LDP_NAVIGATE';
+      url: string;
+      requestId: number;
+    }
+  | {
+      type: 'LDP_DEACTIVATE';
+    };
 
 export type RuntimeMessage = {
   type: 'SYNC_RULES';

@@ -103,22 +103,30 @@ export const SHADOW_STYLES = `
   position: fixed;
   inset: 0;
   z-index: 2147483645;
-  display: none;
+  visibility: hidden;
   pointer-events: none;
 }
 
 .ldp-overlay.is-open {
-  display: block;
+  visibility: visible;
+}
+
+.ldp-overlay:not(.is-open) .ldp-backdrop,
+.ldp-overlay:not(.is-open) .ldp-modal {
+  pointer-events: none !important;
 }
 
 .ldp-backdrop {
   position: fixed;
   inset: 0;
   background: var(--ldp-backdrop);
-  backdrop-filter: blur(2px);
   pointer-events: auto;
   opacity: 0;
   transition: opacity 0.16s ease;
+}
+
+.ldp-overlay.is-open .ldp-backdrop {
+  backdrop-filter: blur(2px);
 }
 
 .ldp-overlay.is-visible .ldp-backdrop {

@@ -1,11 +1,17 @@
-import { getWindowGeometry, saveWindowGeometry } from '../shared/storage';
+import {
+  getWindowGeometry,
+  saveWindowGeometry,
+  subscribeWindowGeometry,
+} from '../shared/storage';
 import {
   PREVIEW_IFRAME_NAME,
   type ExtensionSettings,
   type IframeToParentMessage,
   type ParentToIframeMessage,
   type ResizeDirection,
+  type WindowGeometry,
 } from '../shared/types';
+import { isSameTopicTarget } from './topic-matcher';
 import {
   clampRect,
   computeDraggedRect,
@@ -38,6 +44,10 @@ const ICONS = {
 };
 
 const LOAD_FALLBACK_TIMEOUT_MS = 10000;
+const SPA_NAV_ACK_TIMEOUT_MS = 280;
+const COLD_LOAD_GRACE_MS = 150;
+
+type LoadState = 'idle' | 'loading' | 'ready';
 
 export class PreviewModal {
   private readonly overlay: HTMLDivElement;
@@ -56,12 +66,25 @@ export class PreviewModal {
 
   private settings: ExtensionSettings;
   private cleanMode: boolean;
+  private cachedGeometry: WindowGeometry | null = null;
+  private readonly unsubscribeGeometry: () => void;
+
   private isOpen = false;
   private isMaximized = false;
   private currentUrl = '';
+  private loadedUrl = '';
+  private pendingUrl = '';
+  private loadState: LoadState = 'idle';
+  private isIframeBooted = false;
+  private hasBootingAck = false;
+  private activeRequestId = 0;
+
   private currentRect: WindowRect | null = null;
   private restoreRect: WindowRect | null = null;
   private fallbackTimer: number | null = null;
+  private navAckTimer: number | null = null;
+  private coldLoadGraceTimer: number | null = null;
+  private closeTimer: number | null = null;
   private copyFeedbackTimer: number | null = null;
   private saveTimer: number | null = null;
   private sizeBadgeTimer: number | null = null;
@@ -74,6 +97,7 @@ export class PreviewModal {
     this.overlay.className = 'ldp-overlay';
     this.overlay.setAttribute('role', 'dialog');
     this.overlay.setAttribute('aria-modal', 'true');
+    this.overlay.setAttribute('aria-hidden', 'true');
 
     this.backdrop = document.createElement('div');
     this.backdrop.className = 'ldp-backdrop';
@@ -215,6 +239,16 @@ export class PreviewModal {
     this.overlay.append(this.backdrop, this.modal);
     shadowRoot.appendChild(this.overlay);
 
+    // Pre-apply default geometry so preloaded iframes render at full desktop dimensions
+    this.applyRect(resolveInitialRect(null, this.getViewport()));
+    void this.primeCachedGeometry();
+    this.unsubscribeGeometry = subscribeWindowGeometry((geo) => {
+      this.cachedGeometry = geo;
+      if (!this.isOpen && !this.isMaximized) {
+        this.applyRect(resolveInitialRect(geo, this.getViewport()));
+      }
+    });
+
     window.addEventListener('keydown', this.handleKeyDown, true);
     window.addEventListener('message', this.handleWindowMessage);
     window.addEventListener('resize', this.handleWindowResize);
@@ -230,47 +264,103 @@ export class PreviewModal {
     }
   }
 
-  public async open(url: string, title: string): Promise<void> {
+  /**
+   * Silently begins loading or SPA-navigating to `url` before the user completes clicking,
+   * while the modal remains hidden.
+   */
+  public preload(url: string): void {
+    if (this.isOpen || !url) return;
+    if (this.loadState === 'ready' && isSameTopicTarget(url, this.loadedUrl)) {
+      return;
+    }
+    if (this.loadState === 'loading' && isSameTopicTarget(url, this.pendingUrl)) {
+      return;
+    }
+    this.navigateTo(url, { silent: true, forceHardReload: false });
+  }
+
+  public open(url: string, title: string): void {
+    this.clearCloseTimer();
     this.currentUrl = url;
     this.titleEl.textContent = title || 'Topic 预览';
     this.titleEl.title = title || url;
 
     if (!this.isOpen) {
-      const saved = await getWindowGeometry();
       const viewport = this.getViewport();
       this.isMaximized = false;
       this.restoreRect = null;
       this.modal.classList.remove('is-maximized');
       this.updateMaximizeButtonState();
-      this.applyRect(resolveInitialRect(saved, viewport));
+      this.applyRect(resolveInitialRect(this.cachedGeometry, viewport));
 
       this.isOpen = true;
+      this.overlay.setAttribute('aria-hidden', 'false');
       this.overlay.classList.add('is-open');
       requestAnimationFrame(() => {
-        this.overlay.classList.add('is-visible');
+        if (this.isOpen) {
+          this.overlay.classList.add('is-visible');
+        }
       });
     }
 
-    this.startLoading(url);
+    // 1. Instant open: requested topic is already loaded in the warm iframe
+    if (this.loadState === 'ready' && isSameTopicTarget(url, this.loadedUrl)) {
+      if (this.loadedUrl) {
+        this.currentUrl = this.loadedUrl;
+      }
+      this.finishLoading();
+      this.postCleanModeToIframe();
+      return;
+    }
+
+    // 2. Reuse in-flight preload for the exact same topic without restarting navigation
+    if (this.loadState === 'loading' && isSameTopicTarget(url, this.pendingUrl)) {
+      this.showLoadingIndicators();
+      return;
+    }
+
+    // 3. Navigate via warm Discourse SPA router when available, otherwise load iframe.src
+    this.navigateTo(url, { silent: false, forceHardReload: false });
   }
 
-  public close(): void {
-    if (!this.isOpen) return;
+  public close(options?: { unload?: boolean }): void {
+    const shouldUnload = Boolean(options?.unload);
+    this.clearCloseTimer();
+
+    if (!this.isOpen) {
+      if (shouldUnload) {
+        this.resetIframe();
+      }
+      return;
+    }
+
     this.isOpen = false;
     this.clearFallbackTimer();
     this.overlay.classList.remove('is-visible');
-    window.setTimeout(() => {
+    this.postToIframe({ type: 'LDP_DEACTIVATE' });
+    this.iframe.blur();
+
+    this.closeTimer = window.setTimeout(() => {
+      this.closeTimer = null;
       if (!this.isOpen) {
         this.overlay.classList.remove('is-open');
-        this.iframe.src = 'about:blank';
+        this.overlay.setAttribute('aria-hidden', 'true');
         this.fallbackBanner.classList.remove('is-visible');
+        if (shouldUnload) {
+          this.resetIframe();
+        }
       }
     }, 160);
   }
 
   public destroy(): void {
-    this.close();
+    this.close({ unload: true });
+    this.clearCloseTimer();
     this.clearFallbackTimer();
+    this.clearNavAckTimer();
+    this.clearColdLoadGraceTimer();
+    this.resetIframe();
+    this.unsubscribeGeometry();
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     if (this.copyFeedbackTimer !== null) window.clearTimeout(this.copyFeedbackTimer);
     if (this.sizeBadgeTimer !== null) window.clearTimeout(this.sizeBadgeTimer);
@@ -279,6 +369,18 @@ export class PreviewModal {
     window.removeEventListener('message', this.handleWindowMessage);
     window.removeEventListener('resize', this.handleWindowResize);
     this.overlay.remove();
+  }
+
+  private async primeCachedGeometry(): Promise<void> {
+    try {
+      const saved = await getWindowGeometry();
+      this.cachedGeometry = saved;
+      if (!this.isOpen && !this.isMaximized) {
+        this.applyRect(resolveInitialRect(saved, this.getViewport()));
+      }
+    } catch {
+      // Ignore storage read errors; default geometry already applied
+    }
   }
 
   private createIconButton(
@@ -322,17 +424,17 @@ export class PreviewModal {
       window.clearTimeout(this.saveTimer);
     }
     const snapshot = toWindowGeometry(this.currentRect);
+    this.cachedGeometry = snapshot;
     this.saveTimer = window.setTimeout(() => {
       void saveWindowGeometry(snapshot);
     }, 200);
   }
 
-  private startLoading(url: string): void {
+  private showLoadingIndicators(): void {
     this.clearFallbackTimer();
     this.fallbackBanner.classList.remove('is-visible');
     this.loadingBar.classList.add('is-active');
     this.loadingMask.classList.add('is-active');
-    this.iframe.src = url;
 
     this.fallbackTimer = window.setTimeout(() => {
       if (this.isOpen && this.loadingMask.classList.contains('is-active')) {
@@ -340,6 +442,83 @@ export class PreviewModal {
         this.fallbackBanner.classList.add('is-visible');
       }
     }, LOAD_FALLBACK_TIMEOUT_MS);
+  }
+
+  private navigateTo(
+    url: string,
+    options: { silent: boolean; forceHardReload: boolean },
+  ): void {
+    const requestId = ++this.activeRequestId;
+    this.clearNavAckTimer();
+    this.clearColdLoadGraceTimer();
+    this.clearFallbackTimer();
+
+    this.pendingUrl = url;
+    this.loadState = 'loading';
+    this.fallbackBanner.classList.remove('is-visible');
+
+    if (!options.silent) {
+      this.showLoadingIndicators();
+    }
+
+    const canTrySpa =
+      !options.forceHardReload &&
+      this.isIframeBooted &&
+      Boolean(this.iframe.contentWindow);
+
+    if (canTrySpa) {
+      const posted = this.postToIframe({
+        type: 'LDP_NAVIGATE',
+        url,
+        requestId,
+      });
+      if (posted) {
+        this.navAckTimer = window.setTimeout(() => {
+          this.navAckTimer = null;
+          if (this.activeRequestId === requestId && this.loadState === 'loading') {
+            this.loadViaIframeSrc(url, requestId, false);
+          }
+        }, SPA_NAV_ACK_TIMEOUT_MS);
+        return;
+      }
+    }
+
+    this.loadViaIframeSrc(url, requestId, options.forceHardReload);
+  }
+
+  private loadViaIframeSrc(
+    url: string,
+    requestId: number,
+    forceReload: boolean,
+  ): void {
+    if (this.activeRequestId !== requestId) return;
+    this.clearNavAckTimer();
+    this.clearColdLoadGraceTimer();
+    this.isIframeBooted = false;
+    this.hasBootingAck = false;
+
+    if (forceReload && this.iframe.src === url && this.iframe.contentWindow) {
+      try {
+        this.iframe.contentWindow.location.reload();
+        return;
+      } catch {
+        // Fall through to assigning iframe.src directly
+      }
+    }
+    this.iframe.src = url;
+  }
+
+  private resetIframe(): void {
+    this.activeRequestId += 1;
+    this.clearNavAckTimer();
+    this.clearColdLoadGraceTimer();
+    this.clearFallbackTimer();
+    this.isIframeBooted = false;
+    this.hasBootingAck = false;
+    this.loadState = 'idle';
+    this.loadedUrl = '';
+    this.pendingUrl = '';
+    this.iframe.src = 'about:blank';
   }
 
   private finishLoading(): void {
@@ -356,9 +535,30 @@ export class PreviewModal {
     }
   }
 
+  private clearNavAckTimer(): void {
+    if (this.navAckTimer !== null) {
+      window.clearTimeout(this.navAckTimer);
+      this.navAckTimer = null;
+    }
+  }
+
+  private clearColdLoadGraceTimer(): void {
+    if (this.coldLoadGraceTimer !== null) {
+      window.clearTimeout(this.coldLoadGraceTimer);
+      this.coldLoadGraceTimer = null;
+    }
+  }
+
+  private clearCloseTimer(): void {
+    if (this.closeTimer !== null) {
+      window.clearTimeout(this.closeTimer);
+      this.closeTimer = null;
+    }
+  }
+
   private reload(): void {
     if (!this.currentUrl) return;
-    this.startLoading(this.currentUrl);
+    this.navigateTo(this.currentUrl, { silent: false, forceHardReload: true });
   }
 
   private toggleCleanMode(): void {
@@ -374,17 +574,21 @@ export class PreviewModal {
       : '切换为精简视图（隐藏顶栏与侧栏）';
   }
 
-  private postCleanModeToIframe(): void {
-    if (!this.iframe.contentWindow) return;
-    const message: ParentToIframeMessage = {
-      type: 'LDP_SET_CLEAN_MODE',
-      enabled: this.cleanMode,
-    };
+  private postToIframe(message: ParentToIframeMessage): boolean {
+    if (!this.iframe.contentWindow) return false;
     try {
       this.iframe.contentWindow.postMessage(message, window.location.origin);
+      return true;
     } catch {
-      // Ignore cross-origin / unloaded frame errors
+      return false;
     }
+  }
+
+  private postCleanModeToIframe(): void {
+    this.postToIframe({
+      type: 'LDP_SET_CLEAN_MODE',
+      enabled: this.cleanMode,
+    });
   }
 
   private async copyCurrentUrl(): Promise<void> {
@@ -561,9 +765,36 @@ export class PreviewModal {
   }
 
   private readonly handleIframeLoad = (): void => {
-    if (!this.isOpen || this.iframe.src === 'about:blank') return;
-    this.finishLoading();
+    if (!this.iframe.src || this.iframe.src === 'about:blank') return;
+    if (this.loadState !== 'loading') return;
+
     this.postCleanModeToIframe();
+
+    // If iframe-enhancer is active, wait for its LDP_READY (post-Ember render)
+    if (this.hasBootingAck) {
+      return;
+    }
+
+    // Fallback for non-enhancer pages (e.g. Cloudflare challenge / cross-origin error page)
+    const requestId = this.activeRequestId;
+    this.clearColdLoadGraceTimer();
+    this.coldLoadGraceTimer = window.setTimeout(() => {
+      this.coldLoadGraceTimer = null;
+      if (
+        this.activeRequestId !== requestId ||
+        this.hasBootingAck ||
+        this.loadState !== 'loading'
+      ) {
+        return;
+      }
+      this.isIframeBooted = false;
+      this.loadState = 'ready';
+      this.loadedUrl = this.pendingUrl;
+      this.pendingUrl = '';
+      if (this.isOpen) {
+        this.finishLoading();
+      }
+    }, COLD_LOAD_GRACE_MS);
   };
 
   private readonly handleKeyDown = (event: KeyboardEvent): void => {
@@ -576,7 +807,6 @@ export class PreviewModal {
   };
 
   private readonly handleWindowMessage = (event: MessageEvent): void => {
-    if (!this.isOpen) return;
     if (event.origin !== window.location.origin) return;
     if (event.source !== this.iframe.contentWindow) return;
 
@@ -584,21 +814,80 @@ export class PreviewModal {
     if (!msg || typeof msg.type !== 'string') return;
 
     if (msg.type === 'LDP_CLOSE') {
-      this.close();
+      if (this.isOpen) {
+        this.close();
+      }
       return;
     }
 
-    if (msg.type === 'LDP_READY' || msg.type === 'LDP_META_UPDATE') {
-      if (msg.type === 'LDP_READY') {
-        this.finishLoading();
-        this.postCleanModeToIframe();
+    if (msg.type === 'LDP_BOOTING') {
+      this.hasBootingAck = true;
+      this.clearColdLoadGraceTimer();
+      this.postCleanModeToIframe();
+      return;
+    }
+
+    if (msg.type === 'LDP_NAV_ACK') {
+      if (msg.requestId !== this.activeRequestId) return;
+      this.clearNavAckTimer();
+      if (msg.mode === 'fallback' && this.pendingUrl) {
+        this.loadViaIframeSrc(this.pendingUrl, msg.requestId, false);
       }
-      if (typeof msg.title === 'string' && msg.title.trim()) {
+      return;
+    }
+
+    if (msg.type === 'LDP_READY') {
+      if (
+        typeof msg.requestId === 'number' &&
+        msg.requestId !== this.activeRequestId
+      ) {
+        return;
+      }
+      // Ignore stale initial LDP_READY from an aborted cold load before the new frame boots
+      if (
+        msg.requestId === undefined &&
+        this.loadState === 'loading' &&
+        !this.hasBootingAck
+      ) {
+        return;
+      }
+
+      this.clearNavAckTimer();
+      this.clearColdLoadGraceTimer();
+      this.isIframeBooted = msg.spaCapable !== false;
+      this.loadState = 'ready';
+
+      if (typeof msg.url === 'string' && msg.url.startsWith(window.location.origin)) {
+        this.loadedUrl = msg.url;
+        if (this.isOpen) {
+          this.currentUrl = msg.url;
+        }
+      } else if (this.pendingUrl) {
+        this.loadedUrl = this.pendingUrl;
+      }
+      this.pendingUrl = '';
+
+      if (this.isOpen) {
+        this.finishLoading();
+        if (typeof msg.title === 'string' && msg.title.trim()) {
+          this.titleEl.textContent = msg.title.trim();
+          this.titleEl.title = msg.title.trim();
+        }
+      }
+      this.postCleanModeToIframe();
+      return;
+    }
+
+    if (msg.type === 'LDP_META_UPDATE') {
+      if (typeof msg.url === 'string' && msg.url.startsWith(window.location.origin)) {
+        this.loadedUrl = msg.url;
+        if (this.isOpen) {
+          this.currentUrl = msg.url;
+        }
+      }
+      if (this.isOpen && typeof msg.title === 'string' && msg.title.trim()) {
         this.titleEl.textContent = msg.title.trim();
         this.titleEl.title = msg.title.trim();
-      }
-      if (typeof msg.url === 'string' && msg.url.startsWith(window.location.origin)) {
-        this.currentUrl = msg.url;
       }
     }
   };

@@ -43,10 +43,16 @@ async function bootstrap(): Promise<void> {
   document.documentElement.appendChild(host);
 
   const modal = new PreviewModal(shadowRoot, settings);
-  const trigger = new HoverTrigger(shadowRoot, (url, title) => {
-    syncTheme();
-    void modal.open(url, title);
-  });
+  const trigger = new HoverTrigger(
+    shadowRoot,
+    (url, title) => {
+      syncTheme();
+      modal.open(url, title);
+    },
+    (url) => {
+      modal.preload(url);
+    },
+  );
 
   const applySettings = (next: ExtensionSettings) => {
     settings = next;
@@ -54,7 +60,7 @@ async function bootstrap(): Promise<void> {
     trigger.setEnabled(activeHere);
     modal.updateSettings(settings);
     if (!activeHere) {
-      modal.close();
+      modal.close({ unload: true });
     }
   };
 

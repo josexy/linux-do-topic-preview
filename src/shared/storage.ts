@@ -100,3 +100,36 @@ export function subscribeSettings(
     extApi.raw.storage.onChanged.removeListener(listener);
   };
 }
+
+export function subscribeWindowGeometry(
+  callback: (geometry: WindowGeometry | null) => void,
+): () => void {
+  const listener = (
+    changes: Record<string, chrome.storage.StorageChange>,
+    areaName: string,
+  ) => {
+    if (areaName !== 'local') return;
+    if (!(STORAGE_KEYS.GEOMETRY in changes)) return;
+
+    const raw = changes[STORAGE_KEYS.GEOMETRY].newValue;
+    if (!raw || typeof raw !== 'object') {
+      callback(null);
+      return;
+    }
+    const geo = raw as Partial<WindowGeometry>;
+    if (typeof geo.width !== 'number' || typeof geo.height !== 'number') {
+      callback(null);
+      return;
+    }
+    callback({
+      width: geo.width,
+      height: geo.height,
+      x: typeof geo.x === 'number' ? geo.x : null,
+      y: typeof geo.y === 'number' ? geo.y : null,
+    });
+  };
+  extApi.raw.storage.onChanged.addListener(listener);
+  return () => {
+    extApi.raw.storage.onChanged.removeListener(listener);
+  };
+}

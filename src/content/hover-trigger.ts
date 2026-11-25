@@ -1,6 +1,7 @@
 import { findTopicLinkFromTarget, type MatchedTopicLink } from './topic-matcher';
 
 const HIDE_DELAY_MS = 180;
+const PRELOAD_HOVER_DELAY_MS = 65;
 
 const EYE_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
   <path d="M2 12s3.8-7 10-7 10 7 10 7-3.8 7-10 7S2 12 2 12Z"/>
@@ -10,16 +11,20 @@ const EYE_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 export class HoverTrigger {
   private readonly button: HTMLButtonElement;
   private readonly onPreview: (url: string, title: string) => void;
+  private readonly onPreload?: (url: string, title: string) => void;
   private activeMatch: MatchedTopicLink | null = null;
   private hideTimer: number | null = null;
+  private preloadTimer: number | null = null;
   private enabled = true;
   private isHoveringButton = false;
 
   constructor(
     shadowRoot: ShadowRoot,
     onPreview: (url: string, title: string) => void,
+    onPreload?: (url: string, title: string) => void,
   ) {
     this.onPreview = onPreview;
+    this.onPreload = onPreload;
 
     this.button = document.createElement('button');
     this.button.type = 'button';
@@ -30,6 +35,7 @@ export class HoverTrigger {
 
     this.button.addEventListener('pointerenter', this.handleButtonEnter);
     this.button.addEventListener('pointerleave', this.handleButtonLeave);
+    this.button.addEventListener('pointerdown', this.handleButtonPointerDown);
     this.button.addEventListener('click', this.handleButtonClick);
 
     document.addEventListener('pointerover', this.handleDocumentPointerOver, true);
@@ -47,6 +53,7 @@ export class HoverTrigger {
 
   public hideImmediately(): void {
     this.clearHideTimer();
+    this.clearPreloadTimer();
     this.activeMatch = null;
     this.isHoveringButton = false;
     this.button.classList.remove('is-visible');
@@ -56,6 +63,7 @@ export class HoverTrigger {
     this.hideImmediately();
     this.button.removeEventListener('pointerenter', this.handleButtonEnter);
     this.button.removeEventListener('pointerleave', this.handleButtonLeave);
+    this.button.removeEventListener('pointerdown', this.handleButtonPointerDown);
     this.button.removeEventListener('click', this.handleButtonClick);
     document.removeEventListener('pointerover', this.handleDocumentPointerOver, true);
     document.removeEventListener('pointerout', this.handleDocumentPointerOut, true);
@@ -71,10 +79,18 @@ export class HoverTrigger {
     }
   }
 
+  private clearPreloadTimer(): void {
+    if (this.preloadTimer !== null) {
+      window.clearTimeout(this.preloadTimer);
+      this.preloadTimer = null;
+    }
+  }
+
   private scheduleHide(): void {
     this.clearHideTimer();
     this.hideTimer = window.setTimeout(() => {
       if (!this.isHoveringButton) {
+        this.clearPreloadTimer();
         this.activeMatch = null;
         this.button.classList.remove('is-visible');
       }
@@ -116,6 +132,9 @@ export class HoverTrigger {
     }
 
     this.clearHideTimer();
+    if (this.activeMatch?.url !== matched.url) {
+      this.clearPreloadTimer();
+    }
     this.activeMatch = matched;
     this.positionNearAnchor(matched.element);
     this.button.classList.add('is-visible');
@@ -138,11 +157,32 @@ export class HoverTrigger {
   private readonly handleButtonEnter = (): void => {
     this.isHoveringButton = true;
     this.clearHideTimer();
+    this.clearPreloadTimer();
+
+    if (!this.activeMatch || !this.onPreload) {
+      return;
+    }
+
+    const { url, title } = this.activeMatch;
+    this.preloadTimer = window.setTimeout(() => {
+      this.preloadTimer = null;
+      if (this.isHoveringButton && this.activeMatch?.url === url) {
+        this.onPreload?.(url, title);
+      }
+    }, PRELOAD_HOVER_DELAY_MS);
   };
 
   private readonly handleButtonLeave = (): void => {
     this.isHoveringButton = false;
+    this.clearPreloadTimer();
     this.scheduleHide();
+  };
+
+  private readonly handleButtonPointerDown = (event: PointerEvent): void => {
+    if (event.button !== 0 || !this.activeMatch || !this.onPreload) return;
+    this.clearPreloadTimer();
+    const { url, title } = this.activeMatch;
+    this.onPreload(url, title);
   };
 
   private readonly handleButtonClick = (event: MouseEvent): void => {
